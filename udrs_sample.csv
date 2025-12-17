@@ -1,0 +1,3 @@
+resource_group,route_table_name,route_name
+my-resource-group,my-route-table,DefaultRoute
+another-resource-group,spoke-route-table,InternetRoute

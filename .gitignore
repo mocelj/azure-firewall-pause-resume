@@ -1,0 +1,17 @@
+# Configuration files with sensitive info
+azfw.env
+.env
+
+# Generated state files
+firewall_config.json
+
+# Data files
+udrs.csv
+
+# System files
+.DS_Store
+
+# Backups and temporary files
+* - Copy.sh
+*.bak
+*.tmp
