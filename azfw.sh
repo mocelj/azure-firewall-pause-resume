@@ -490,22 +490,24 @@ allocate_firewall() {
     
     # Use ip-config create with --vnet-name (automatically uses AzureFirewallSubnet)
     log_info "Adding IP configuration to firewall..."
-    if ! az network firewall ip-config create \
+    local az_output
+    az_output=$(az network firewall ip-config create \
         --resource-group "$RG" \
         --firewall-name "$FW" \
         --name "$config_name" \
         --vnet-name "$VNET_NAME" \
         --public-ip-address "$public_ip_name" \
-        --output none 2>&1 | grep -v "UserWarning"; then
-        
+        --output none 2>&1) || {
         log_error "Failed to add firewall IP configuration"
+        log_error "Azure CLI error: $(echo "$az_output" | grep -v "UserWarning")"
+        log_error ""
         log_error "Please check:"
         log_error "  - VNet '$VNET_NAME' exists in resource group '$VNET_RG'"
         log_error "  - Public IP '$public_ip_name' exists"
         log_error "  - AzureFirewallSubnet exists in the VNet"
         log_error "  - You have proper permissions"
         exit 1
-    fi
+    }
     
     log_info "Firewall allocation initiated, waiting for completion..."
     
