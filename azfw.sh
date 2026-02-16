@@ -300,11 +300,14 @@ get_firewall_status() {
             --resource-group "$RG" \
             --name "$FW" \
             --output json 2>&1)
-        log_error "Failed to get firewall information. Please check:"
+        log_error "Failed to get firewall information."
+        log_error "Azure CLI error: $error_msg"
+        log_error ""
+        log_error "Please check:"
+        log_error "  - You are logged in (run 'az login' if needed)"
         log_error "  - Resource group '$RG' exists"
         log_error "  - Firewall '$FW' exists"
         log_error "  - You have proper permissions"
-        log_debug "Error: $error_msg"
         exit 1
     fi
     
