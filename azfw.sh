@@ -383,35 +383,98 @@ load_ip_configuration() {
 deallocate_firewall() {
     log_info "Deallocating firewall '$FW'..."
     
-    if [[ "$DRY_RUN" == "true" ]]; then
-        log_dry_run "Would deallocate firewall '$FW' in resource group '$RG'"
-        return 0
-    fi
-    
-    # Get list of all IP configuration names
-    local ip_config_names
-    ip_config_names=$(az network firewall show \
+    # Check if firewall has a management IP configuration (Basic tier)
+    local fw_json
+    fw_json=$(az network firewall show \
         --resource-group "$RG" \
         --name "$FW" \
-        --query "ipConfigurations[].name" \
-        --output tsv)
+        --output json 2>/dev/null | tr -d '\r')
+    
+    local has_mgmt_config
+    has_mgmt_config=$(echo "$fw_json" | jq '.managementIpConfiguration != null')
+    
+    local ip_config_names
+    ip_config_names=$(echo "$fw_json" | jq -r '.ipConfigurations[].name // empty')
     
     if [[ -z "$ip_config_names" ]]; then
         log_warn "No IP configurations found to remove"
         return 0
     fi
     
-    # Delete each IP configuration explicitly
-    for config_name in $ip_config_names; do
-        log_info "Removing IP configuration: $config_name"
-        az network firewall ip-config delete \
-            --resource-group "$RG" \
-            --firewall-name "$FW" \
-            --name "$config_name" \
-            --output none
-    done
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_dry_run "Would deallocate firewall '$FW' in resource group '$RG'"
+        if [[ "$has_mgmt_config" == "true" ]]; then
+            log_dry_run "Basic tier detected - will use REST API to remove data and management IP configs atomically"
+        else
+            log_dry_run "Will remove IP configurations via CLI: $ip_config_names"
+        fi
+        return 0
+    fi
     
-    log_info "Firewall deallocation initiated, waiting for completion..."
+    if [[ "$has_mgmt_config" == "true" ]]; then
+        # Basic tier: must remove data IP configs and management IP config atomically via REST API
+        # The CLI cannot delete the data IP config while a management IP config exists
+        log_info "Basic tier detected - using REST API for atomic deallocation"
+        
+        local fw_id
+        fw_id=$(echo "$fw_json" | jq -r '.id')
+        
+        # Build a minimal PUT body preserving essential properties, clearing IP configs
+        local dealloc_body
+        dealloc_body=$(echo "$fw_json" | jq '{
+            location: .location,
+            properties: {
+                ipConfigurations: [],
+                managementIpConfiguration: null,
+                sku: .sku,
+                firewallPolicy: (if .firewallPolicy then {id: .firewallPolicy.id} else null end),
+                threatIntelMode: .threatIntelMode
+            }
+        }')
+        
+        local temp_body
+        temp_body=$(mktemp)
+        echo "$dealloc_body" > "$temp_body"
+        
+        log_debug "REST API PUT body:"
+        log_debug "$dealloc_body"
+        
+        local rest_output
+        rest_output=$(az rest --method PUT \
+            --url "$fw_id" \
+            --url-parameters api-version=2024-05-01 \
+            --body @"$temp_body" \
+            --output json 2>&1) || {
+            log_error "Failed to deallocate firewall via REST API"
+            log_error "Error: $(echo "$rest_output" | grep -v "UserWarning")"
+            rm -f "$temp_body"
+            exit 1
+        }
+        
+        rm -f "$temp_body"
+        
+        local prov_state
+        prov_state=$(echo "$rest_output" | jq -r '.properties.provisioningState // empty')
+        
+        if [[ "$prov_state" == "Succeeded" ]]; then
+            log_info "Firewall deallocated successfully"
+            return 0
+        fi
+        
+        log_info "Firewall deallocation initiated (state: $prov_state), waiting for completion..."
+    else
+        # Standard tier: delete each IP configuration via CLI
+        for config_name in $ip_config_names; do
+            log_info "Removing IP configuration: $config_name"
+            az network firewall ip-config delete \
+                --resource-group "$RG" \
+                --firewall-name "$FW" \
+                --name "$config_name" \
+                --output none
+        done
+        
+        log_info "Firewall deallocation initiated, waiting for completion..."
+    fi
     
     # Wait for deallocation to complete by checking IP configuration count
     local max_wait=600  # 10 minutes max
@@ -472,12 +535,23 @@ allocate_firewall() {
     log_debug "Public IP ID: $public_ip_id"
     log_debug "Original private IP: $original_private_ip"
     
+    # Check for management IP configuration (for dry-run display)
+    local mgmt_config_dry
+    mgmt_config_dry=$(echo "$saved_config" | jq '.managementIpConfiguration // empty')
+    
     if [[ "$DRY_RUN" == "true" ]]; then
         log_dry_run "Would allocate firewall with:"
         log_dry_run "  Config name: $config_name"
         log_dry_run "  VNet: $VNET_NAME (RG: $VNET_RG)"
         log_dry_run "  Subnet: $FW_SUBNET_NAME"
         log_dry_run "  Public IP: $public_ip_id"
+        if [[ -n "$mgmt_config_dry" && "$mgmt_config_dry" != "null" ]]; then
+            local dry_mgmt_name dry_mgmt_pip
+            dry_mgmt_name=$(echo "$mgmt_config_dry" | jq -r '.name')
+            dry_mgmt_pip=$(echo "$mgmt_config_dry" | jq -r '.publicIPAddress.id // .publicIpAddress.id // empty' | awk -F'/' '{print $NF}')
+            log_dry_run "  Management config: $dry_mgmt_name"
+            log_dry_run "  Management Public IP: $dry_mgmt_pip"
+        fi
         return 0
     fi
     
@@ -488,6 +562,25 @@ allocate_firewall() {
     log_debug "Public IP name: $public_ip_name"
     log_debug "VNet: $VNET_NAME (RG: $VNET_RG)"
     
+    # Check for management IP configuration (required for Basic tier)
+    local mgmt_config
+    mgmt_config=$(echo "$saved_config" | jq '.managementIpConfiguration // empty')
+    
+    local mgmt_args=()
+    if [[ -n "$mgmt_config" && "$mgmt_config" != "null" ]]; then
+        local mgmt_config_name mgmt_public_ip_id mgmt_public_ip_name
+        mgmt_config_name=$(echo "$mgmt_config" | jq -r '.name')
+        mgmt_public_ip_id=$(echo "$mgmt_config" | jq -r '.publicIPAddress.id // .publicIpAddress.id // empty')
+        mgmt_public_ip_name=$(echo "$mgmt_public_ip_id" | awk -F'/' '{print $NF}')
+        
+        if [[ -n "$mgmt_public_ip_name" ]]; then
+            log_info "Management IP configuration detected (Basic tier)"
+            log_debug "Management config name: $mgmt_config_name"
+            log_debug "Management public IP: $mgmt_public_ip_name"
+            mgmt_args=(--m-name "$mgmt_config_name" --m-public-ip-address "$mgmt_public_ip_name" --m-vnet-name "$VNET_NAME")
+        fi
+    fi
+    
     # Use ip-config create with --vnet-name (automatically uses AzureFirewallSubnet)
     log_info "Adding IP configuration to firewall..."
     local az_output
@@ -497,6 +590,7 @@ allocate_firewall() {
         --name "$config_name" \
         --vnet-name "$VNET_NAME" \
         --public-ip-address "$public_ip_name" \
+        "${mgmt_args[@]}" \
         --output none 2>&1) || {
         log_error "Failed to add firewall IP configuration"
         log_error "Azure CLI error: $(echo "$az_output" | grep -v "UserWarning")"
@@ -505,6 +599,10 @@ allocate_firewall() {
         log_error "  - VNet '$VNET_NAME' exists in resource group '$VNET_RG'"
         log_error "  - Public IP '$public_ip_name' exists"
         log_error "  - AzureFirewallSubnet exists in the VNet"
+        if [[ ${#mgmt_args[@]} -gt 0 ]]; then
+            log_error "  - AzureFirewallManagementSubnet exists in the VNet (required for Basic tier)"
+            log_error "  - Management public IP exists"
+        fi
         log_error "  - You have proper permissions"
         exit 1
     }
