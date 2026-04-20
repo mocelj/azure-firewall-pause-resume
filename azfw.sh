@@ -350,6 +350,11 @@ save_ip_configuration() {
             log_debug "Configuration content:"
             echo "$ip_configs" | jq '.'
         else
+            # Backup existing config before overwriting
+            if [[ -f "$CONFIG_FILE" ]]; then
+                cp "$CONFIG_FILE" "${CONFIG_FILE}.bak"
+                log_info "Backed up existing configuration to ${CONFIG_FILE}.bak"
+            fi
             echo "$ip_configs" > "$CONFIG_FILE"
             log_info "IP configuration saved to $CONFIG_FILE"
         fi
@@ -624,20 +629,63 @@ allocate_firewall() {
             --name "$FW" \
             --output json 2>/dev/null)
         
+        # Check provisioning state for early failure detection
+        local current_prov_state
+        current_prov_state=$(echo "$current_status" | jq -r '.provisioningState // empty')
+        
+        if [[ "$current_prov_state" == "Failed" ]]; then
+            log_error "Firewall provisioning failed!"
+            log_error ""
+            
+            # Query activity log for error details
+            log_info "Querying activity log for error details..."
+            local activity_error
+            activity_error=$(az monitor activity-log list \
+                --resource-group "$RG" \
+                --start-time "$(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ)" \
+                --query "[?contains(resourceId || '', 'azureFirewalls') && status.value=='Failed'].properties.statusMessage" \
+                --output tsv 2>/dev/null | head -1)
+            
+            if [[ -n "$activity_error" ]]; then
+                local error_code error_message
+                error_code=$(echo "$activity_error" | jq -r '.error.code // .error.details[0].code // "Unknown"' 2>/dev/null)
+                error_message=$(echo "$activity_error" | jq -r '.error.message // .error.details[0].message // "No details available"' 2>/dev/null)
+                log_error "Error code: $error_code"
+                log_error "Error message: $error_message"
+                
+                # Detect transient errors and hint at re-run
+                if [[ "$error_code" == "InternalServerError" || "$error_code" == "RetryableError" || "$error_message" == *"An error occurred"* || "$error_message" == *"internal"* ]]; then
+                    log_warn ""
+                    log_warn "This appears to be a transient Azure platform error."
+                    log_warn "You can safely re-run the resume command to retry:"
+                    log_warn "  $(basename "$0") resume $([ "$VERBOSE" == "true" ] && echo "--verbose")"
+                fi
+            else
+                log_error "No error details found in activity log"
+            fi
+            
+            log_error ""
+            log_error "The saved configuration file has NOT been modified."
+            log_error "It is safe to re-run 'resume' to retry the allocation."
+            exit 1
+        fi
+        
         # Handle both formats: privateIPAddress (capital IP) or privateIpAddress
         new_private_ip=$(echo "$current_status" | jq -r '.ipConfigurations[0].privateIPAddress // .ipConfigurations[0].privateIpAddress // empty')
         
-        if [[ -n "$new_private_ip" ]]; then
+        if [[ -n "$new_private_ip" && "$current_prov_state" == "Succeeded" ]]; then
             break
         fi
         
         sleep $check_interval
         wait_time=$((wait_time + check_interval))
-        log_debug "Waiting for allocation... (${wait_time}s elapsed)"
+        log_debug "Waiting for allocation... (${wait_time}s elapsed, state: $current_prov_state)"
     done
     
     if [[ -z "$new_private_ip" ]]; then
-        log_error "Failed to get new private IP after allocation"
+        log_error "Failed to get new private IP after allocation (timeout after ${max_wait}s)"
+        log_error "The firewall may still be provisioning. Check status with:"
+        log_error "  $(basename "$0") status"
         exit 1
     fi
     
@@ -723,6 +771,17 @@ pause_firewall() {
     # Get current firewall status
     local fw_info
     fw_info=$(get_firewall_status)
+    
+    # Check provisioning state - refuse to save config if firewall is in Failed state
+    local prov_state
+    prov_state=$(echo "$fw_info" | jq -r '.provisioningState')
+    
+    if [[ "$prov_state" == "Failed" ]]; then
+        log_error "Firewall is in 'Failed' provisioning state"
+        log_error "Saving configuration from a failed firewall could overwrite a known-good config"
+        log_error "Please resolve the failed state first (e.g., re-run 'resume') before pausing"
+        exit 1
+    fi
     
     # Check if already deallocated
     local ip_count
